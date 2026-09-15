@@ -1,94 +1,146 @@
 require('dotenv').config();
 const express = require('express');
-const bodyParser = require('body-parser');
-const path = require('path');
+const cors = require('cors');
 const DomainNameApi = require('nodejs-dna');
 
 const app = express();
-app.use(bodyParser.json());
-app.use(express.static(path.join(__dirname, 'public')));
 
-// Initialize Domain Name API Client for L3 Markets
-const dnaClient = new DomainNameApi(
-  process.env.RESELLER_ID,
-  process.env.API_KEY
-);
+// 1. Configure Full Open CORS Policy (Fixes Browser Blocking)
+const corsOptions = {
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // Pre-flight options handler for all routes
+
+// 2. Parse JSON Payload Data
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// 3. Initialize Domain Name API Client for L3 Markets
+const resellerId = process.env.RESELLER_ID || '63ee50a9-2031-181a-df7b-3a23b6486daf';
+const apiKey = process.env.API_KEY || 'yat7dN3z6ZEGzsBhm792sqUl6SPpBmU6NFMI1fyk';
+
+const dnaClient = new DomainNameApi(resellerId, apiKey);
+
+// Health Check Endpoint (Loads when opening https://hosting-5572.onrender.com directly)
+app.get('/', (req, res) => {
+  res.status(200).json({
+    status: 'Active',
+    company: 'L3 Markets Backend Server',
+    message: 'Domain Name API integration service is running successfully.'
+  });
+});
 
 // 1. Endpoint: Check Domain Availability
 app.post('/api/check-domain', async (req, res) => {
-  const { domainName, tld } = req.body; // e.g., domainName: 'mybrand', tld: 'com'
-
-  if (!domainName || !tld) {
-    return res.status(400).json({ error: 'Domain name and TLD are required.' });
-  }
-
   try {
-    const results = await dnaClient.CheckAvailability([domainName], [tld], 1);
-    
-    // Response array handling
-    if (Array.isArray(results) && results.length > 0) {
-      const item = results[0];
-      return res.json({
-        domain: `${item.DomainName}.${item.TLD}`,
-        status: item.Status, // 'available' or 'notavailable'
-        price: item.Price,
-        currency: item.Currency || 'USD'
-      });
+    const { domainName, tld } = req.body;
+    if (!domainName || !tld) {
+      return res.status(400).json({ error: 'Both domainName and tld are required.' });
     }
-
-    res.status(500).json({ error: 'Unexpected response from registrar.' });
+    const result = await dnaClient.CheckAvailability([domainName], [tld], 1);
+    res.json(result);
   } catch (error) {
-    console.error('L3 Markets API Error:', error);
-    res.status(500).json({ error: 'Failed to check domain availability.' });
+    res.status(500).json({ error: error.message || 'Error checking domain availability.' });
   }
 });
 
-// 2. Endpoint: Register Domain for User
+// 2. Endpoint: Register New Domain
 app.post('/api/register-domain', async (req, res) => {
-  const { domainName, period, contactInfo, nameservers } = req.body;
-
-  if (!domainName || !contactInfo) {
-    return res.status(400).json({ error: 'Missing registration parameters.' });
-  }
-
-  const registrationData = {
-    DomainName: domainName,
-    Period: period || 1,
-    NameServers: nameservers || ['ns1.domainnameapi.com', 'ns2.domainnameapi.com'],
-    Contacts: {
-      Registrant: {
-        FirstName: contactInfo.firstName,
-        LastName: contactInfo.lastName,
-        EMail: contactInfo.email,
-        Phone: contactInfo.phone,
-        Address: contactInfo.address,
-        City: contactInfo.city,
-        State: contactInfo.state || 'N/A',
-        ZipCode: contactInfo.zip,
-        Country: contactInfo.countryCode || 'ZA', // Defaulting to South Africa ISO
-        Company: 'L3 Markets Client'
-      }
-    }
-  };
-
   try {
-    const result = await dnaClient.RegisterDomain(registrationData);
-    if (result && result.result === 'OK') {
-      return res.json({
-        success: true,
-        message: `Website domain ${domainName} successfully registered under L3 Markets!`,
-        details: result.data
-      });
-    }
-
-    res.status(400).json({ success: false, error: result.error || 'Registration failed.' });
+    const result = await dnaClient.RegisterDomain(req.body);
+    res.json(result);
   } catch (error) {
-    console.error('Registration Error:', error);
-    res.status(500).json({ error: 'Server error processing registration.' });
+    res.status(500).json({ error: error.message || 'Error registering domain.' });
   }
 });
 
+// 3. Endpoint: Domain Transfer
+app.post('/api/transfer-domain', async (req, res) => {
+  try {
+    const result = await dnaClient.TransferDomain(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Error executing domain transfer.' });
+  }
+});
+
+// 4. Endpoint: Domain Renewal
+app.post('/api/renew-domain', async (req, res) => {
+  try {
+    const result = await dnaClient.RenewDomain(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Error renewing domain.' });
+  }
+});
+
+// 5. Endpoint: Update Nameservers
+app.post('/api/update-nameservers', async (req, res) => {
+  try {
+    const result = await dnaClient.SaveNameservers(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Error updating nameservers.' });
+  }
+});
+
+// 6. Endpoint: Manage DNS Records
+app.post('/api/manage-dns', async (req, res) => {
+  try {
+    const result = await dnaClient.AddDnsRecord(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Error adding DNS record.' });
+  }
+});
+
+// 7. Endpoint: Child Nameservers (Glue Records)
+app.post('/api/child-nameservers', async (req, res) => {
+  try {
+    const result = await dnaClient.AddChildNameServer(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Error creating child nameserver.' });
+  }
+});
+
+// 8. Endpoint: Update WHOIS Contacts
+app.post('/api/update-contacts', async (req, res) => {
+  try {
+    const result = await dnaClient.SaveContactInformation(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Error updating contact details.' });
+  }
+});
+
+// 9. Endpoint: Toggle Transfer Lock Status
+app.post('/api/toggle-lock', async (req, res) => {
+  try {
+    const result = await dnaClient.ModifyTransferLock(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Error modifying transfer lock.' });
+  }
+});
+
+// 10. Endpoint: Retrieve EPP / Auth Code
+app.post('/api/get-epp', async (req, res) => {
+  try {
+    const result = await dnaClient.GetEppCode(req.body);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Error retrieving EPP code.' });
+  }
+});
+
+// Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`L3 Markets Hosting Platform running at http://localhost:${PORT}`);
+  console.log(`L3 Markets API Backend running on port ${PORT}`);
 });
