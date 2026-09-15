@@ -5,7 +5,7 @@ const DomainNameApi = require('nodejs-dna');
 
 const app = express();
 
-// 1. Configure Full Open CORS Policy (Fixes Browser Blocking)
+// 1. Configure Full Open CORS Policy (Handles all pre-flight OPTIONS automatically)
 const corsOptions = {
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -14,7 +14,6 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // Pre-flight options handler for all routes
 
 // 2. Parse JSON Payload Data
 app.use(express.json());
@@ -26,7 +25,7 @@ const apiKey = process.env.API_KEY || 'yat7dN3z6ZEGzsBhm792sqUl6SPpBmU6NFMI1fyk'
 
 const dnaClient = new DomainNameApi(resellerId, apiKey);
 
-// Health Check Endpoint (Loads when opening https://hosting-5572.onrender.com directly)
+// Health Check Endpoint
 app.get('/', (req, res) => {
   res.status(200).json({
     status: 'Active',
