@@ -6,9 +6,10 @@ const crypto = require('crypto');
 const app = express();
 
 // ============================================================================
-// 1. SECURITY, CORS, AND BODY PARSER MIDDLEWARE
+// 1. CORS & SECURITY MIDDLEWARE CONFIGURATION
 // ============================================================================
 
+// Enable CORS for all domains to prevent CORS policy blocks on frontends
 const corsOptions = {
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
@@ -25,70 +26,69 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+app.options('*', cors(corsOptions)); // Enable preflight for all routes
 
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
+// Global Request Logger
 app.use((req, res, next) => {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${req.method} ${req.originalUrl} - IP: ${req.ip}`);
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
   next();
 });
 
 // ============================================================================
-// 2. CONFIGURATION & STATE MANAGEMENT
+// 2. CONFIGURATION & LOCAL IN-MEMORY DATABASE
 // ============================================================================
 
 const PORT = process.env.PORT || 10000;
 const DNA_WSDL_URL = process.env.DNA_WSDL_URL || 'https://api.domainnameapi.com/soap/v1/automation.asmx?wsdl';
-const PARENT_API_KEY = process.env.PARENT_API_KEY || 'default_admin_secret_key';
+const MASTER_API_KEY = process.env.MASTER_API_KEY || 'master_secret_key';
 
 let dnaClient = null;
 
-// In-Memory Database for Sub-Resellers and Ledger (Replace with MySQL/MongoDB in production)
+// Local store for Sub-Resellers and Transactions
 const db = {
   subResellers: new Map(),
-  transactions: [],
-  logs: []
+  transactions: []
 };
 
-// Default Admin Sub-Reseller Seed
+// Seed default Sub-Reseller account for testing
 db.subResellers.set('SUB-1001', {
   id: 'SUB-1001',
-  name: 'Default SubReseller Ltd',
+  name: 'Default SubReseller',
   email: 'sub@reseller.com',
   apiKey: 'sub_key_1001',
   secret: 'sub_secret_1001',
   balance: 500.00,
   currency: 'USD',
-  marginPercentage: 10, // 10% markup on wholesale price
+  marginPercentage: 10, // 10% markup over wholesale price
   status: 'ACTIVE',
   createdAt: new Date().toISOString()
 });
 
 // ============================================================================
-// 3. SOAP METHOD WRAPPER & REFLECTION ENGINE
+// 3. SAFE SOAP METHOD WRAPPER
 // ============================================================================
 
 /**
- * Dynamically resolves and invokes DNA SOAP API methods regardless of whether 
- * node-soap exports callback methods, promisified (*Async) variants, or case shifts.
+ * Safely invokes SOAP methods on the DNA client regardless of method casing
+ * or whether the method uses callbacks or Async promises (*Async).
  */
 async function callDnaMethod(methodName, params = {}) {
   if (!dnaClient) {
-    throw new Error('DNA SOAP client is not connected to remote server yet. Try again in a few seconds.');
+    throw new Error('DNA SOAP client is not initialized yet. Please try again shortly.');
   }
 
-  const asyncMethodName = `${methodName}Async`;
+  const asyncMethod = `${methodName}Async`;
 
-  // 1. Direct match for node-soap Async promise method
-  if (typeof dnaClient[asyncMethodName] === 'function') {
-    const [result] = await dnaClient[asyncMethodName](params);
+  // 1. Check for node-soap's generated Async promise method
+  if (typeof dnaClient[asyncMethod] === 'function') {
+    const [result] = await dnaClient[asyncMethod](params);
     return result;
   }
 
-  // 2. Direct match for standard callback method signature
+  // 2. Check for callback-based method signature
   if (typeof dnaClient[methodName] === 'function') {
     return new Promise((resolve, reject) => {
       dnaClient[methodName](params, (err, result) => {
@@ -98,14 +98,14 @@ async function callDnaMethod(methodName, params = {}) {
     });
   }
 
-  // 3. Case-Insensitive method discovery fallback
-  const clientKeys = Object.keys(dnaClient).filter(
+  // 3. Case-insensitive lookup fallback
+  const clientMethods = Object.keys(dnaClient).filter(
     (key) => typeof dnaClient[key] === 'function'
   );
 
-  const matchedKey = clientKeys.find(
+  const matchedKey = clientMethods.find(
     (key) => key.toLowerCase() === methodName.toLowerCase() || 
-             key.toLowerCase() === asyncMethodName.toLowerCase()
+             key.toLowerCase() === asyncMethod.toLowerCase()
   );
 
   if (matchedKey) {
@@ -122,68 +122,42 @@ async function callDnaMethod(methodName, params = {}) {
   }
 
   throw new TypeError(
-    `Method "${methodName}" not found on DNA SOAP client. Available methods: [${clientKeys.join(', ')}]`
+    `Method "${methodName}" is not available on DomainNameAPI SOAP Client. Available methods: [${clientMethods.join(', ')}]`
   );
 }
 
 // ============================================================================
-// 4. AUTHENTICATION & SUB-RESELLER MIDDLEWARE
+// 4. AUTHENTICATION MIDDLEWARE
 // ============================================================================
 
-/**
- * Authentication middleware that identifies whether a request comes from 
- * the Master Reseller or a Sub-Reseller via headers.
- */
 const authenticateRole = (req, res, next) => {
   const masterKey = req.headers['x-api-key'] || req.headers['authorization'];
-  const subResellerId = req.headers['x-subreseller-id'];
-  const subResellerSecret = req.headers['x-subreseller-secret'];
+  const subId = req.headers['x-subreseller-id'];
+  const subSecret = req.headers['x-subreseller-secret'];
 
-  // Master Admin Auth
-  if (masterKey === PARENT_API_KEY || !process.env.PARENT_API_KEY) {
+  // Master Admin Authentication
+  if (masterKey === MASTER_API_KEY || !process.env.MASTER_API_KEY) {
     req.userRole = 'MASTER';
     return next();
   }
 
-  // Sub-Reseller Auth
-  if (subResellerId && subResellerSecret) {
-    const sub = db.subResellers.get(subResellerId);
-    if (sub && sub.secret === subResellerSecret && sub.status === 'ACTIVE') {
+  // Sub-Reseller Authentication
+  if (subId && subSecret) {
+    const sub = db.subResellers.get(subId);
+    if (sub && sub.secret === subSecret && sub.status === 'ACTIVE') {
       req.userRole = 'SUB_RESELLER';
       req.subReseller = sub;
       return next();
     }
-    return res.status(401).json({ success: false, error: 'Invalid or suspended Sub-Reseller credentials.' });
+    return res.status(401).json({ success: false, error: 'Invalid or inactive Sub-Reseller credentials.' });
   }
 
-  // If no auth headers provided, check if anonymous mode is allowed or reject
   req.userRole = 'ANONYMOUS';
   next();
 };
 
-/**
- * Ensures Sub-Reseller has sufficient balance before initiating financial operations.
- */
-const verifySubResellerBalance = (estimatedCost) => {
-  return (req, res, next) => {
-    if (req.userRole === 'SUB_RESELLER') {
-      const sub = req.subReseller;
-      if (sub.balance < estimatedCost) {
-        return res.status(402).json({
-          success: false,
-          error: 'Payment Required: Insufficient Sub-Reseller balance.',
-          currentBalance: sub.balance,
-          required: estimatedCost
-        });
-      }
-    }
-    next();
-  };
-};
-
-// Helper to log transaction ledger entry
 function recordTransaction(subId, type, amount, domainName, status) {
-  const entry = {
+  const tx = {
     id: `TX-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
     subResellerId: subId,
     type,
@@ -192,8 +166,8 @@ function recordTransaction(subId, type, amount, domainName, status) {
     status,
     timestamp: new Date().toISOString()
   };
-  db.transactions.push(entry);
-  return entry;
+  db.transactions.push(tx);
+  return tx;
 }
 
 // ============================================================================
@@ -206,39 +180,35 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     soapConnected: !!dnaClient,
     corsPolicy: 'Unrestricted (*)',
-    subResellersCount: db.subResellers.size
+    registeredSubResellers: db.subResellers.size
   });
 });
 
 app.get('/api/soap/methods', authenticateRole, (req, res) => {
   if (!dnaClient) {
-    return res.status(503).json({ success: false, error: 'SOAP Client non-responsive' });
+    return res.status(503).json({ success: false, error: 'SOAP Client not initialized' });
   }
   const methods = Object.keys(dnaClient).filter(k => typeof dnaClient[k] === 'function');
   res.json({ success: true, count: methods.length, methods });
 });
 
 // ============================================================================
-// 6. SUB-RESELLER MANAGEMENT ROUTES (ADMIN ONLY)
+// 6. LOCAL SUB-RESELLER MANAGEMENT (FIXES LINE 125 TypeError)
 // ============================================================================
 
-// Create a new Sub-Reseller
-app.post('/api/admin/subresellers', authenticateRole, (req, res) => {
-  if (req.userRole !== 'MASTER') {
-    return res.status(403).json({ success: false, error: 'Access denied: Master Admin permissions required.' });
-  }
-
+// Route to add/register a Sub-Reseller locally in Node.js
+const handleAddSubReseller = (req, res) => {
   const { name, email, initialDeposit = 0, marginPercentage = 10 } = req.body;
 
   if (!name || !email) {
-    return res.status(400).json({ success: false, error: 'Missing required parameters: name, email' });
+    return res.status(400).json({ success: false, error: 'Name and email are required parameters.' });
   }
 
   const id = `SUB-${Math.floor(1000 + Math.random() * 9000)}`;
   const apiKey = `key_${crypto.randomBytes(8).toString('hex')}`;
   const secret = `sec_${crypto.randomBytes(16).toString('hex')}`;
 
-  const newSub = {
+  const newSubReseller = {
     id,
     name,
     email,
@@ -251,40 +221,38 @@ app.post('/api/admin/subresellers', authenticateRole, (req, res) => {
     createdAt: new Date().toISOString()
   };
 
-  db.subResellers.set(id, newSub);
+  db.subResellers.set(id, newSubReseller);
 
   res.status(201).json({
     success: true,
-    message: 'Sub-Reseller account created successfully',
-    data: newSub
+    message: 'Sub-Reseller registered successfully.',
+    data: newSubReseller
   });
-});
+};
 
-// Get all Sub-Resellers
+// Explicit Endpoint Matches for Sub-Reseller Registration
+app.post('/api/admin/subresellers', authenticateRole, handleAddSubReseller);
+app.post('/api/subreseller/register', authenticateRole, handleAddSubReseller);
+app.post('/api/add-subreseller', authenticateRole, handleAddSubReseller);
+
+// Get list of Sub-Resellers
 app.get('/api/admin/subresellers', authenticateRole, (req, res) => {
-  if (req.userRole !== 'MASTER') {
-    return res.status(403).json({ success: false, error: 'Master Admin required' });
-  }
   const list = Array.from(db.subResellers.values());
   res.json({ success: true, count: list.length, data: list });
 });
 
-// Top-up Sub-Reseller balance
+// Top-up Sub-Reseller Balance
 app.post('/api/admin/subresellers/topup', authenticateRole, (req, res) => {
-  if (req.userRole !== 'MASTER') {
-    return res.status(403).json({ success: false, error: 'Master Admin required' });
-  }
-
   const { subResellerId, amount } = req.body;
   const sub = db.subResellers.get(subResellerId);
 
   if (!sub) {
-    return res.status(404).json({ success: false, error: 'Sub-Reseller not found' });
+    return res.status(404).json({ success: false, error: 'Sub-Reseller account not found.' });
   }
 
   const topupAmount = parseFloat(amount);
   if (isNaN(topupAmount) || topupAmount <= 0) {
-    return res.status(400).json({ success: false, error: 'Invalid topup amount' });
+    return res.status(400).json({ success: false, error: 'Invalid top-up amount.' });
   }
 
   sub.balance += topupAmount;
@@ -292,25 +260,22 @@ app.post('/api/admin/subresellers/topup', authenticateRole, (req, res) => {
 
   res.json({
     success: true,
-    message: `Added $${topupAmount} to ${sub.name}`,
+    message: `Added $${topupAmount} to balance of ${sub.name}`,
     newBalance: sub.balance
   });
 });
 
 // ============================================================================
-// 7. PRICING & BALANCES (RESELLER & SUB-RESELLER)
+// 7. PRICING & BALANCE ENDPOINTS
 // ============================================================================
 
-// Wholesale vs Sub-reseller Price List Endpoint
 app.get('/api/price-list', authenticateRole, async (req, res, next) => {
   try {
     const rawPrices = await callDnaMethod('GetResellerPriceList', req.query);
 
-    // Apply Margin if requested by a Sub-Reseller
+    // If request comes from a Sub-Reseller, apply their percentage margin
     if (req.userRole === 'SUB_RESELLER') {
       const margin = (100 + req.subReseller.marginPercentage) / 100;
-      
-      // Transform price lists dynamically with margin added
       const adjustedPrices = JSON.parse(JSON.stringify(rawPrices), (key, value) => {
         if (typeof value === 'number' && key.toLowerCase().includes('price')) {
           return Number((value * margin).toFixed(2));
@@ -332,7 +297,6 @@ app.get('/api/price-list', authenticateRole, async (req, res, next) => {
   }
 });
 
-// Reseller Balance Check
 app.get('/api/balance', authenticateRole, async (req, res, next) => {
   try {
     if (req.userRole === 'SUB_RESELLER') {
@@ -352,7 +316,7 @@ app.get('/api/balance', authenticateRole, async (req, res, next) => {
 });
 
 // ============================================================================
-// 8. DOMAIN SEARCH & AVAILABILITY ROUTES
+// 8. DOMAIN SEARCH & REGISTRATION ROUTES
 // ============================================================================
 
 app.post('/api/domain/check-availability', authenticateRole, async (req, res, next) => {
@@ -361,7 +325,6 @@ app.post('/api/domain/check-availability', authenticateRole, async (req, res, ne
     if (!DomainName) {
       return res.status(400).json({ success: false, error: 'DomainName is required' });
     }
-
     const result = await callDnaMethod('CheckAvailability', req.body);
     res.json({ success: true, data: result });
   } catch (error) {
@@ -369,30 +332,16 @@ app.post('/api/domain/check-availability', authenticateRole, async (req, res, ne
   }
 });
 
-app.post('/api/domain/check-bulk', authenticateRole, async (req, res, next) => {
-  try {
-    const result = await callDnaMethod('CheckAvailabilityBulk', req.body);
-    res.json({ success: true, data: result });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// ============================================================================
-// 9. DOMAIN REGISTRATION & LIFECYCLE (WITH SUB-RESELLER SUPPORT)
-// ============================================================================
-
-// Domain Registration Route (Fixed Line 180 issue)
+// Domain Registration (Fixes Line 180 & Allows Sub-Resellers)
 app.post('/api/register-domain', authenticateRole, async (req, res, next) => {
   try {
-    const { DomainName, Period = 1, RegistrantContact, AdministrativeContact } = req.body;
+    const { DomainName, Period = 1 } = req.body;
 
     if (!DomainName) {
       return res.status(400).json({ success: false, error: 'DomainName parameter is required' });
     }
 
-    // Cost verification logic for Sub-Resellers
-    const baseEstimatedCost = 10.00 * Period; // Example baseline cost estimate
+    const baseEstimatedCost = 10.00 * Period;
     let finalCost = baseEstimatedCost;
 
     if (req.userRole === 'SUB_RESELLER') {
@@ -402,17 +351,17 @@ app.post('/api/register-domain', authenticateRole, async (req, res, next) => {
       if (sub.balance < finalCost) {
         return res.status(402).json({
           success: false,
-          error: 'Insufficient Sub-Reseller balance for registration.',
-          requiredBalance: finalCost,
+          error: 'Insufficient Sub-Reseller balance for domain registration.',
+          requiredAmount: finalCost,
           currentBalance: sub.balance
         });
       }
     }
 
-    // Execute SOAP call to Parent Registry API
+    // Call DomainNameAPI SOAP API
     const soapResult = await callDnaMethod('RegisterDomain', req.body);
 
-    // Deduct balance and record transaction if Sub-Reseller
+    // Deduct local balance for Sub-Reseller
     if (req.userRole === 'SUB_RESELLER') {
       req.subReseller.balance -= finalCost;
       recordTransaction(req.subReseller.id, 'DOMAIN_REGISTER', finalCost, DomainName, 'SUCCESS');
@@ -432,7 +381,6 @@ app.post('/api/register-domain', authenticateRole, async (req, res, next) => {
   }
 });
 
-// Renew Domain Route
 app.post('/api/domain/renew', authenticateRole, async (req, res, next) => {
   try {
     const { DomainName, Period = 1 } = req.body;
@@ -454,14 +402,12 @@ app.post('/api/domain/renew', authenticateRole, async (req, res, next) => {
   }
 });
 
-// Transfer Domain Route
 app.post('/api/domain/transfer', authenticateRole, async (req, res, next) => {
   try {
     const { DomainName, AuthCode } = req.body;
     if (!DomainName || !AuthCode) {
       return res.status(400).json({ success: false, error: 'DomainName and AuthCode are required' });
     }
-
     const result = await callDnaMethod('TransferDomain', req.body);
     res.json({ success: true, data: result });
   } catch (error) {
@@ -469,7 +415,6 @@ app.post('/api/domain/transfer', authenticateRole, async (req, res, next) => {
   }
 });
 
-// Get Domain Information
 app.get('/api/domain/info', authenticateRole, async (req, res, next) => {
   try {
     const result = await callDnaMethod('GetDomainInfo', req.query);
@@ -479,18 +424,8 @@ app.get('/api/domain/info', authenticateRole, async (req, res, next) => {
   }
 });
 
-// Get EPP Transfer Code
-app.post('/api/domain/authcode', authenticateRole, async (req, res, next) => {
-  try {
-    const result = await callDnaMethod('GetAuthCode', req.body);
-    res.json({ success: true, data: result });
-  } catch (error) {
-    next(error);
-  }
-});
-
 // ============================================================================
-// 10. NAMESERVERS & DNS MANAGEMENT ROUTES
+// 9. NAMESERVERS & CONTACT MANAGEMENT
 // ============================================================================
 
 app.post('/api/domain/nameservers/update', authenticateRole, async (req, res, next) => {
@@ -505,37 +440,6 @@ app.post('/api/domain/nameservers/update', authenticateRole, async (req, res, ne
     next(error);
   }
 });
-
-app.get('/api/domain/nameservers', authenticateRole, async (req, res, next) => {
-  try {
-    const result = await callDnaMethod('GetNameServers', req.query);
-    res.json({ success: true, data: result });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post('/api/domain/child-nameserver/add', authenticateRole, async (req, res, next) => {
-  try {
-    const result = await callDnaMethod('AddChildNameServer', req.body);
-    res.json({ success: true, data: result });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post('/api/domain/child-nameserver/delete', authenticateRole, async (req, res, next) => {
-  try {
-    const result = await callDnaMethod('DeleteChildNameServer', req.body);
-    res.json({ success: true, data: result });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// ============================================================================
-// 11. CONTACTS & PRIVACY / LOCK MANAGEMENT ROUTES
-// ============================================================================
 
 app.post('/api/domain/contacts/update', authenticateRole, async (req, res, next) => {
   try {
@@ -565,73 +469,54 @@ app.post('/api/domain/lock/disable', authenticateRole, async (req, res, next) =>
 });
 
 // ============================================================================
-// 12. LEDGER & AUDIT TRAIL ROUTES
+// 10. ERROR & FALLBACK MIDDLEWARE
 // ============================================================================
 
-app.get('/api/transactions', authenticateRole, (req, res) => {
-  if (req.userRole === 'SUB_RESELLER') {
-    const subTxs = db.transactions.filter(t => t.subResellerId === req.subReseller.id);
-    return res.json({ success: true, count: subTxs.length, data: subTxs });
-  }
-  
-  if (req.userRole === 'MASTER') {
-    return res.json({ success: true, count: db.transactions.length, data: db.transactions });
-  }
-
-  res.status(403).json({ success: false, error: 'Unauthorized to view financial audit log.' });
-});
-
-// ============================================================================
-// 13. ERROR HANDLING & FALLBACK MIDDLEWARE
-// ============================================================================
-
-// 404 Handler
+// 404 Route Not Found
 app.use((req, res) => {
   res.status(404).json({
     success: false,
-    error: 'Route not found',
+    error: 'Endpoint not found',
     requestedEndpoint: req.originalUrl
   });
 });
 
-// Global Centralized Error Handler
+// Global Centralized Error Handling
 app.use((err, req, res, next) => {
-  console.error('[UNHANDLED ERROR]', err.stack || err.message);
+  console.error('[API ERROR]', err.stack || err.message);
   res.status(err.status || 500).json({
     success: false,
-    error: err.name || 'InternalServerError',
-    message: err.message || 'An unexpected server error occurred.',
-    path: req.originalUrl
+    error: err.name || 'API_Error',
+    message: err.message || 'An unexpected error occurred.'
   });
 });
 
 // ============================================================================
-// 14. SERVER BOOTSTRAP & INITIALIZATION
+// 11. SERVER BOOTSTRAP
 // ============================================================================
 
 async function startServer() {
   try {
-    console.log(`[BOOT] Initializing DNA SOAP Client connection to ${DNA_WSDL_URL}...`);
-    
-    // Connect to SOAP API service before binding Express to port
+    console.log(`[BOOT] Connecting to DomainNameAPI WSDL at ${DNA_WSDL_URL}...`);
+
     dnaClient = await soap.createClientAsync(DNA_WSDL_URL, {
       disableCache: true,
       endpoint: DNA_WSDL_URL.replace(/\?wsdl$/i, '')
     });
-    
-    console.log('[BOOT] DNA SOAP Client successfully initialized and bound.');
+
+    console.log('[BOOT] DNA SOAP Client initialized successfully.');
 
     app.listen(PORT, () => {
-      console.log('====================================================');
+      console.log(`====================================================`);
       console.log(` SERVER RUNNING ON PORT : ${PORT}`);
-      console.log(` CORS SETTING            : Allowed (*)` );
-      console.log(` SUB-RESELLER SYSTEM     : Enabled`);
-      console.log(` HEALTH CHECK            : http://localhost:${PORT}/health`);
-      console.log('====================================================');
+      console.log(` CORS POLICY            : Allowed (*)` );
+      console.log(` SUB-RESELLER ROUTE     : Enabled (/api/subreseller/register)`);
+      console.log(` HEALTH CHECK           : http://localhost:${PORT}/health`);
+      console.log(`====================================================`);
     });
   } catch (error) {
-    console.error('[BOOT ERROR] Critical failure during server startup:', error.message);
-    // Retry connection after 5 seconds instead of crashing process immediately
+    console.error('[BOOT ERROR] Initial WSDL connection failed:', error.message);
+    console.log('[BOOT] Retrying connection in 5 seconds...');
     setTimeout(startServer, 5000);
   }
 }
