@@ -9,7 +9,7 @@ const app = express();
 // 1. CORS & SECURITY MIDDLEWARE CONFIGURATION
 // ============================================================================
 
-// Enable CORS for all domains to prevent CORS policy blocks on frontends
+// Enable CORS for all origins and headers
 const corsOptions = {
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
@@ -25,8 +25,8 @@ const corsOptions = {
   optionsSuccessStatus: 200
 };
 
+// app.use(cors(...)) handles both regular and OPTIONS preflight requests automatically
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // Enable preflight for all routes
 
 app.use(express.json({ limit: '15mb' }));
 app.use(express.urlencoded({ extended: true, limit: '15mb' }));
@@ -193,10 +193,9 @@ app.get('/api/soap/methods', authenticateRole, (req, res) => {
 });
 
 // ============================================================================
-// 6. LOCAL SUB-RESELLER MANAGEMENT (FIXES LINE 125 TypeError)
+// 6. LOCAL SUB-RESELLER MANAGEMENT
 // ============================================================================
 
-// Route to add/register a Sub-Reseller locally in Node.js
 const handleAddSubReseller = (req, res) => {
   const { name, email, initialDeposit = 0, marginPercentage = 10 } = req.body;
 
@@ -230,18 +229,15 @@ const handleAddSubReseller = (req, res) => {
   });
 };
 
-// Explicit Endpoint Matches for Sub-Reseller Registration
 app.post('/api/admin/subresellers', authenticateRole, handleAddSubReseller);
 app.post('/api/subreseller/register', authenticateRole, handleAddSubReseller);
 app.post('/api/add-subreseller', authenticateRole, handleAddSubReseller);
 
-// Get list of Sub-Resellers
 app.get('/api/admin/subresellers', authenticateRole, (req, res) => {
   const list = Array.from(db.subResellers.values());
   res.json({ success: true, count: list.length, data: list });
 });
 
-// Top-up Sub-Reseller Balance
 app.post('/api/admin/subresellers/topup', authenticateRole, (req, res) => {
   const { subResellerId, amount } = req.body;
   const sub = db.subResellers.get(subResellerId);
@@ -273,7 +269,6 @@ app.get('/api/price-list', authenticateRole, async (req, res, next) => {
   try {
     const rawPrices = await callDnaMethod('GetResellerPriceList', req.query);
 
-    // If request comes from a Sub-Reseller, apply their percentage margin
     if (req.userRole === 'SUB_RESELLER') {
       const margin = (100 + req.subReseller.marginPercentage) / 100;
       const adjustedPrices = JSON.parse(JSON.stringify(rawPrices), (key, value) => {
@@ -332,7 +327,6 @@ app.post('/api/domain/check-availability', authenticateRole, async (req, res, ne
   }
 });
 
-// Domain Registration (Fixes Line 180 & Allows Sub-Resellers)
 app.post('/api/register-domain', authenticateRole, async (req, res, next) => {
   try {
     const { DomainName, Period = 1 } = req.body;
@@ -358,10 +352,8 @@ app.post('/api/register-domain', authenticateRole, async (req, res, next) => {
       }
     }
 
-    // Call DomainNameAPI SOAP API
     const soapResult = await callDnaMethod('RegisterDomain', req.body);
 
-    // Deduct local balance for Sub-Reseller
     if (req.userRole === 'SUB_RESELLER') {
       req.subReseller.balance -= finalCost;
       recordTransaction(req.subReseller.id, 'DOMAIN_REGISTER', finalCost, DomainName, 'SUCCESS');
